@@ -1,9 +1,13 @@
 #!/bin/bash
 
 set -eu
+set -o pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 077
 
 PRODUCT_NAME="Claude Kill Switch for macOS"
-PRODUCT_VERSION="1.0.3"
+PRODUCT_VERSION="1.0.4"
 ANCHOR_NAME="io.github.claude-killswitch.macos"
 ANCHOR_FILE="/etc/pf.anchors/${ANCHOR_NAME}"
 PF_CONF="/etc/pf.conf"
@@ -23,20 +27,40 @@ VERIFY_ACTIVE=0
 VERIFY_ROUTE_ADDED=0
 VERIFY_GATEWAY=""
 VERIFY_ADDRESS=""
+VERIFY_INTERFACE=""
+VERIFY_RULES_CHANGED=0
 
 cleanup() {
-  if [ "$VERIFY_ACTIVE" -eq 1 ]; then
-    /sbin/pfctl -a "$ANCHOR_NAME" -f "$ANCHOR_FILE" >/dev/null 2>&1 || true
-    if [ "$VERIFY_ROUTE_ADDED" -eq 1 ] && [ -n "$VERIFY_GATEWAY" ] && [ -n "$VERIFY_ADDRESS" ]; then
-      /sbin/route -n delete -host "$VERIFY_ADDRESS" "$VERIFY_GATEWAY" >/dev/null 2>&1 || true
+  local result
+  result=0
+  if [ "$VERIFY_RULES_CHANGED" -eq 1 ]; then
+    if /sbin/pfctl -a "$ANCHOR_NAME" -f "$ANCHOR_FILE" >/dev/null 2>&1 && runtime_rules_complete; then
+      VERIFY_RULES_CHANGED=0
+    else
+      say "错误：正式防护恢复未确认，请运行 status 检查。" >&2
+      result=1
     fi
   fi
-  if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
-    /bin/rm -rf "$TEMP_DIR"
+  if ! remove_test_route; then
+    say "错误：测试路由清理未确认；保留失败状态，不能视为验收通过。" >&2
+    result=1
   fi
+  if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+    /bin/rm -rf "$TEMP_DIR" || result=1
+    TEMP_DIR=""
+  fi
+  return "$result"
 }
 
-trap cleanup EXIT
+finish() {
+  local result
+  result=$1
+  trap - EXIT
+  if ! cleanup; then result=1; fi
+  exit "$result"
+}
+
+trap 'finish "$?"' EXIT
 trap 'exit 130' HUP INT TERM
 
 say() {
@@ -46,6 +70,60 @@ say() {
 fail() {
   printf '错误：%s\n' "$*" >&2
   exit 1
+}
+
+unverified() {
+  say "未验证：$*" >&2
+  exit 2
+}
+
+path_metadata_safe() {
+  local owner mode acl
+  owner=$1
+  mode=$2
+  acl=$3
+  [ "$owner" = "0" ] || return 1
+  case "$mode" in ''|*[!0-7]*) return 1 ;; esac
+  [ "$((8#$mode & 0022))" -eq 0 ] || return 1
+  # Deny ACLs are normal on macOS. Any extra write-granting ACL requires
+  # manual review instead of silently trusting a privileged execution path.
+  if printf '%s\n' "$acl" | awk '
+    / allow / && /write|append|add_file|add_subdirectory|delete|chown/ { bad=1 }
+    END { exit !bad }
+  '; then return 1; fi
+}
+
+secure_path() {
+  local path current part metadata owner mode acl old_ifs
+  path=$1
+  # These are the standard system aliases, not arbitrary user symlinks.
+  case "$path" in
+    /etc/*) path="/private/etc/${path#/etc/}" ;;
+    /var/*) path="/private/var/${path#/var/}" ;;
+  esac
+  current=""
+  old_ifs=$IFS
+  IFS=/
+  for part in $path; do
+    [ -n "$part" ] || continue
+    current="${current}/${part}"
+    [ ! -L "$current" ] || { IFS=$old_ifs; return 1; }
+    if [ -e "$current" ]; then
+      metadata=$(/usr/bin/stat -f '%u %Lp' "$current") || { IFS=$old_ifs; return 1; }
+      owner=${metadata%% *}
+      mode=${metadata#* }
+      acl=$(/bin/ls -lde "$current") || { IFS=$old_ifs; return 1; }
+      path_metadata_safe "$owner" "$mode" "$acl" || { IFS=$old_ifs; return 1; }
+    fi
+  done
+  IFS=$old_ifs
+}
+
+assert_secure_installation_paths() {
+  local path
+  for path in "$INSTALL_PATH" "$DAEMON_PLIST" "$ANCHOR_FILE" "$PF_CONF" "$STATE_DIR" "$STATE_FILE" "$BACKUP_DIR"; do
+    secure_path "$path" || fail "拒绝使用不安全的安装路径（所有者、写权限、ACL 或符号链接异常）。"
+  done
 }
 
 require_root() {
@@ -59,17 +137,16 @@ make_temp_dir() {
 }
 
 physical_interfaces() {
-  /usr/sbin/networksetup -listallhardwareports 2>/dev/null \
-    | awk '
-        /^Hardware Port:/ { port=substr($0, index($0, ":") + 2) }
-        /^Device:/ {
-          device=$2
-          if (device ~ /^en[0-9]+$/ || device ~ /^bridge[0-9]+$/) {
-            print device
-          }
-        }
-      ' \
-    | sort -u
+  local ports
+  ports=$(/usr/sbin/networksetup -listallhardwareports 2>/dev/null) || {
+    say "错误：无法读取物理网卡，覆盖范围未确认。" >&2
+    return 1
+  }
+  printf '%s\n' "$ports" | awk '
+    /^Device:/ {
+      if ($2 ~ /^en[0-9]+$/ || $2 ~ /^bridge[0-9]+$/) print $2
+    }
+  ' | sort -u
 }
 
 strip_managed_block() {
@@ -302,6 +379,7 @@ install_rules() {
   local pf_was_enabled pf_token enable_output load_result
   mode=${1:-install}
   require_root install
+  assert_secure_installation_paths
   [ -r "$PF_CONF" ] || fail "找不到 ${PF_CONF}"
 
   interfaces=$(physical_interfaces)
@@ -361,8 +439,8 @@ install_rules() {
     else
       /bin/rm -f "$ANCHOR_FILE"
     fi
-    /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || true
-    fail "载入规则失败，已恢复原配置"
+    /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || fail "载入和回滚均失败，请检查 pf 状态"
+    fail "载入失败；原配置已重新载入，请用原版本 status 复核"
   fi
 
   pf_token=""
@@ -374,8 +452,8 @@ install_rules() {
       else
         /bin/rm -f "$ANCHOR_FILE"
       fi
-      /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || true
-      fail "启用 pf 失败，已恢复原配置"
+      /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || fail "启用与配置回滚均失败，请检查 pf 状态"
+      fail "启用 pf 失败；原配置已重新载入，请检查防护状态"
     }
     pf_token=$(printf '%s\n' "$enable_output" | awk '/Token/ { print $NF; exit }')
   fi
@@ -402,6 +480,7 @@ install_rules() {
 
 watch_rules() {
   require_root watch
+  assert_secure_installation_paths
   while :; do
     if ! configuration_complete; then
       install_rules repair >/dev/null 2>&1
@@ -507,74 +586,127 @@ status_rules() {
   [ "$installed" = "是" ] && [ "$pf_now" = "Enabled" ] && [ "$covered" = "是" ] && [ "$daemon" = "运行中" ]
 }
 
+# A probe owns one scoped host route. A lookup falling back to a different
+# destination is not that route. A matching prefix with a changed gateway or
+# interface belongs to someone else now and must not be removed.
+test_route_state() {
+  local info destination gateway interface flags
+  info=$(/sbin/route -n get -host -ifscope "$VERIFY_INTERFACE" "$VERIFY_ADDRESS" 2>/dev/null) || return 1
+  destination=$(printf '%s\n' "$info" | awk '/^[[:space:]]*destination:/ {print $2; exit}')
+  gateway=$(printf '%s\n' "$info" | awk '/^[[:space:]]*gateway:/ {print $2; exit}')
+  interface=$(printf '%s\n' "$info" | awk '/^[[:space:]]*interface:/ {print $2; exit}')
+  flags=$(printf '%s\n' "$info" | awk '/^[[:space:]]*flags:/ {print $2; exit}')
+  [ "$destination" = "$VERIFY_ADDRESS" ] || return 3
+  case "$flags" in *HOST*IFSCOPE*) ;; *) return 3 ;; esac
+  [ "$gateway" = "$VERIFY_GATEWAY" ] && [ "$interface" = "$VERIFY_INTERFACE" ] || return 4
+}
+
+remove_test_route() {
+  local state
+  [ "$VERIFY_ROUTE_ADDED" -eq 1 ] || return 0
+  state=0
+  test_route_state || state=$?
+  if [ "$state" -eq 3 ]; then
+    VERIFY_ROUTE_ADDED=0
+    return 0
+  fi
+  [ "$state" -eq 0 ] || return 1
+  # Preserve any route with the same destination on another interface.
+  /sbin/route -n delete -host -ifscope "$VERIFY_INTERFACE" "$VERIFY_ADDRESS" "$VERIFY_GATEWAY" >/dev/null 2>&1 || :
+  state=0
+  test_route_state || state=$?
+  [ "$state" -eq 3 ] || return 1
+  VERIFY_ROUTE_ADDED=0
+}
+
+verify_rule_packets() {
+  local rules
+  rules=$(/sbin/pfctl -a "$ANCHOR_NAME" -vvsr 2>/dev/null) || return 1
+  printf '%s\n' "$rules" | awk -v label="${ANCHOR_NAME}.verify" '
+    /^@?[0-9]*[[:space:]]*block / {found=(index($0, "label \"" label "\"") > 0)}
+    found && /Packets:/ {
+      for (i=1;i<=NF;i++) if ($i=="Packets:") {print $(i+1); exit}
+    }
+  '
+}
+
 verify_rules() {
   local default_info default_interface default_gateway interfaces verify_anchor
-  local candidate bait_address bait_port
+  local candidate bait_address bait_port packets
   require_root verify
+  assert_secure_installation_paths
   status_rules >/dev/null || fail "安装状态不完整，请先运行 sudo \"${0}\" install"
 
-  default_info=$(/sbin/route -n get default 2>/dev/null || true)
+  default_info=$(/sbin/route -n get default 2>/dev/null) || unverified "无法读取默认物理出口"
   default_interface=$(printf '%s\n' "$default_info" | awk '/interface:/ { print $2; exit }')
   default_gateway=$(printf '%s\n' "$default_info" | awk '/gateway:/ { print $2; exit }')
-  [ -n "$default_interface" ] || fail "无法识别默认物理接口"
-  [ -n "$default_gateway" ] || fail "无法识别默认网关"
-
-  interfaces=$(physical_interfaces)
+  [ -n "$default_interface" ] && [ -n "$default_gateway" ] || unverified "默认物理出口不完整"
+  interfaces=$(physical_interfaces) || unverified "物理网卡发现失败"
   printf '%s\n' "$interfaces" | grep -qx "$default_interface" \
-    || fail "默认出口不是受保护的物理接口，无法执行安全验收"
+    || unverified "默认出口不是受保护的物理接口"
 
   VERIFY_ACTIVE=1
   VERIFY_GATEWAY=$default_gateway
+  VERIFY_INTERFACE=$default_interface
   bait_address=""
-  bait_port=""
   for candidate in $BAIT_CANDIDATES; do
     VERIFY_ADDRESS=${candidate%:*}
     bait_port=${candidate##*:}
-    if /sbin/route -n add -host "$VERIFY_ADDRESS" "$default_gateway" >/dev/null 2>&1; then
+    # Scoped routes plus a bound socket affect only the test's physical path.
+    if /sbin/route -n add -host -ifscope "$VERIFY_INTERFACE" "$VERIFY_ADDRESS" "$VERIFY_GATEWAY" >/dev/null 2>&1; then
       VERIFY_ROUTE_ADDED=1
-      if /usr/bin/nc -z -G 3 "$VERIFY_ADDRESS" "$bait_port" >/dev/null 2>&1; then
+      test_route_state || fail "无法确认测试路由的完整身份"
+      if /usr/bin/nc -n -b "$VERIFY_INTERFACE" -z -G 3 "$VERIFY_ADDRESS" "$bait_port" >/dev/null 2>&1; then
         bait_address=$VERIFY_ADDRESS
         break
       fi
-      /sbin/route -n delete -host "$VERIFY_ADDRESS" "$default_gateway" >/dev/null 2>&1 || true
-      VERIFY_ROUTE_ADDED=0
+      remove_test_route || fail "不可达诱饵的测试路由清理失败"
     fi
   done
-
-  if [ -z "$bait_address" ]; then
-    fail "诱饵地址基线不可达，无法验证；正式规则保持不变"
-  fi
+  [ -n "$bait_address" ] || unverified "所有诱饵基线均不可达；没有证明阻断有效"
 
   TEMP_DIR=$(make_temp_dir)
   verify_anchor="${TEMP_DIR}/anchor.verify"
   /bin/cp "$ANCHOR_FILE" "$verify_anchor"
-  say "block drop out quick on ${default_interface} inet from any to ${bait_address}" >> "$verify_anchor"
+  say "block drop out quick on ${default_interface} inet from any to ${bait_address} label \"${ANCHOR_NAME}.verify\"" >> "$verify_anchor"
   /sbin/pfctl -nf "$verify_anchor" >/dev/null
-
+  VERIFY_RULES_CHANGED=1
   /sbin/pfctl -a "$ANCHOR_NAME" -f "$verify_anchor" >/dev/null
-  if /usr/bin/nc -z -G 3 "$bait_address" "$bait_port" >/dev/null 2>&1; then
-    fail "阻断验收失败；正式规则将自动恢复"
+  if /usr/bin/nc -n -b "$VERIFY_INTERFACE" -z -G 3 "$bait_address" "$bait_port" >/dev/null 2>&1; then
+    fail "阻断失败；将尝试恢复正式防护与测试路由"
   fi
+  packets=$(verify_rule_packets) || unverified "无法读取诱饵规则命中证据"
+  case "$packets" in ''|*[!0-9]*) unverified "没有有效的诱饵命中计数" ;; esac
+  [ "$packets" -gt 0 ] || unverified "诱饵连接失败，但没有本项目规则命中证据"
 
   /sbin/pfctl -a "$ANCHOR_NAME" -f "$ANCHOR_FILE" >/dev/null
-  if ! /usr/bin/nc -z -G 3 "$bait_address" "$bait_port" >/dev/null 2>&1; then
-    fail "恢复验收失败；请检查当前网络"
-  fi
-
-  say "验收通过：物理接口上的同构规则已完成成功→阻断→恢复 A/B 测试。"
-  say "测试未连接 Anthropic。"
+  runtime_rules_complete || fail "正式规则恢复后的回读检查失败"
+  VERIFY_RULES_CHANGED=0
+  /usr/bin/nc -n -b "$VERIFY_INTERFACE" -z -G 3 "$bait_address" "$bait_port" >/dev/null 2>&1 \
+    || fail "恢复后的基线连接失败"
+  cleanup || fail "测试清理未完整成功"
+  say "配置检查：通过（两个官方入站 IPv4 网段及全部物理接口）。"
+  say "实测通过：IPv4/TCP 诱饵可达→本项目规则命中并阻断→恢复可达；测试路由已清理。"
+  say "未实测：Anthropic 正式目标、IPv6、UDP/QUIC；本次测试未连接 Anthropic。"
 }
 
 uninstall_rules() {
-  local pf_candidate timestamp pf_was_enabled pf_token
+  local pf_candidate timestamp pf_was_enabled pf_token remaining_rules previous_pf
   require_root uninstall
+  assert_secure_installation_paths
   [ -r "$PF_CONF" ] || fail "找不到 ${PF_CONF}"
 
-  /bin/launchctl bootout "system/${DAEMON_LABEL}" >/dev/null 2>&1 || true
-  /bin/rm -f "$DAEMON_PLIST"
-
+  # Do not remove rules while a registered watcher could recreate them.
+  if /bin/launchctl print "system/${DAEMON_LABEL}" >/dev/null 2>&1; then
+    /bin/launchctl bootout "system/${DAEMON_LABEL}" >/dev/null 2>&1 || fail "守护服务停止失败；防护与安装文件均保留"
+  fi
+  if /bin/launchctl print "system/${DAEMON_LABEL}" >/dev/null 2>&1; then
+    fail "守护服务仍已注册，拒绝继续卸载"
+  fi
   TEMP_DIR=$(make_temp_dir)
   pf_candidate="${TEMP_DIR}/pf.conf"
+  previous_pf="${TEMP_DIR}/pf.before"
+  /bin/cp -p "$PF_CONF" "$previous_pf"
   strip_managed_block "$PF_CONF" "$pf_candidate"
   /sbin/pfctl -nf "$pf_candidate" >/dev/null
 
@@ -590,17 +722,27 @@ uninstall_rules() {
   fi
 
   /usr/bin/install -o root -g wheel -m 644 "$pf_candidate" "$PF_CONF"
-  /bin/rm -f "$ANCHOR_FILE"
-  /sbin/pfctl -f "$PF_CONF" >/dev/null
+  if ! /sbin/pfctl -f "$PF_CONF" >/dev/null; then
+    /usr/bin/install -o root -g wheel -m 644 "$previous_pf" "$PF_CONF"
+    /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || fail "卸载载入与回滚失败；防护文件和状态均保留，请检查 pf"
+    /bin/launchctl bootstrap system "$DAEMON_PLIST" >/dev/null 2>&1 || fail "卸载已中止；规则已重新载入，但守护服务恢复失败"
+    fail "卸载已中止，原配置已重新载入；请运行 status 复核"
+  fi
+  remaining_rules=$(/sbin/pfctl -sr 2>/dev/null) || fail "无法回读卸载后的主规则；状态与备份保留"
+  if printf '%s\n' "$remaining_rules" | grep -Fq "anchor \"${ANCHOR_NAME}\""; then
+    fail "主规则仍引用本项目；拒绝报告卸载成功"
+  fi
+  /bin/rm -f "$ANCHOR_FILE" "$DAEMON_PLIST"
 
   if [ "$pf_was_enabled" = "0" ]; then
     if [ -n "$pf_token" ]; then
-      /sbin/pfctl -X "$pf_token" >/dev/null 2>&1 || /sbin/pfctl -d >/dev/null 2>&1 || true
+      /sbin/pfctl -X "$pf_token" >/dev/null 2>&1 || fail "无法释放本项目 pf 引用；安装状态与备份保留供检查"
     else
-      /sbin/pfctl -d >/dev/null 2>&1 || true
+      /sbin/pfctl -d >/dev/null 2>&1 || fail "无法恢复安装前 pf 状态；状态文件保留供检查"
     fi
   fi
 
+  [ ! -e "$ANCHOR_FILE" ] && [ ! -e "$DAEMON_PLIST" ] || fail "防护文件仍有残留"
   /bin/rm -rf "$STATE_DIR"
   /bin/rm -f "$INSTALL_PATH"
   say "${PRODUCT_NAME} 已卸载，安装前后的 pf.conf 备份保留在 ${BACKUP_DIR}。"

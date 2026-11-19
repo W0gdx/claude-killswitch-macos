@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.4 - 2026-11-19
+
+- Follow the upstream repository through c64ead3, documenting macOS equivalents and the remaining per-application filtering boundary.
+- Use a fixed privileged PATH and reject unsafe installation path ownership, write permissions, ACLs and symlinks.
+- Verify a bound physical-interface TCP decoy with scoped routes and labelled pf packet evidence; read back rule restoration and exact route cleanup. Distinguish failure (1) from unverified (2).
+- Refuse to report successful uninstall when daemon shutdown, rule removal or state restoration fails.
+- Add a separate optional Python network diagnostic with local-only defaults, explicit HTTPS-proxy/STUN probes and redacted output.
+- Expand offline regression coverage, including complete verification success, unverified evidence and restoration/cleanup failures.
+
 ## 1.0.3 - 2026-11-19
 
 - Validate both official inbound IPv4 ranges and IPv6/NAT64 tables in the live kernel, together with exact outbound block rules on every physical interface and the root anchor reference.
